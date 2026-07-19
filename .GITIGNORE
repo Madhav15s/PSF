@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test cache
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Generated datasets / large files
+dataset/generated/
+dataset/raw/
+artifacts/
+input/
+
+# OS
+.DS_Store
+Thumbs.db
