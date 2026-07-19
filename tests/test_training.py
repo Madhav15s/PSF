@@ -6,6 +6,7 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
 import torch
 from PIL import Image
 
@@ -62,6 +63,29 @@ def test_psf_dataset_reads_manifest_and_targets(tmp_path: Path) -> None:
     assert sample_image.shape == (3, 64, 64)
     assert sample_target.shape == (5,)
     assert torch.allclose(sample_target, torch.tensor(metadata["weights"], dtype=torch.float32))
+
+
+def test_psf_dataset_keeps_manifest_loading_lazy_for_missing_files(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = data_dir / "train.csv"
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sample_id", "blurred_path", "metadata_path"])
+        writer.writeheader()
+        writer.writerow(
+            {
+                "sample_id": "000001",
+                "blurred_path": "train/sample.png",
+                "metadata_path": "metadata/sample.json",
+            }
+        )
+
+    dataset = PSFDataset(root_dir=data_dir, manifest_path=manifest_path, image_key="blurred_path", target_dim=5)
+
+    assert len(dataset) == 1
+    with pytest.raises(FileNotFoundError):
+        dataset[0]
 
 
 def test_resnet18_regressor_outputs_requested_dimension() -> None:

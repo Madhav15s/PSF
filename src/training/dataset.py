@@ -49,9 +49,6 @@ class PSFDataset(Dataset):
         return image, target
 
     def _load_manifest(self) -> list[tuple[Path, Path]]:
-        if not self.manifest_path.exists():
-            raise FileNotFoundError(f"manifest does not exist: {self.manifest_path}")
-
         with self.manifest_path.open("r", encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
 
@@ -89,16 +86,9 @@ class PSFDataset(Dataset):
     def _resolve_path(self, raw_path: str) -> Path | None:
         if not raw_path:
             return None
+
         candidate = Path(raw_path)
-        if candidate.is_absolute() and candidate.exists():
+        if candidate.is_absolute():
             return candidate
-        if (self.root_dir / candidate).exists():
-            return self.root_dir / candidate
-        if self.manifest_path.parent / candidate:
-            try:
-                path = (self.manifest_path.parent / candidate).resolve()
-                if path.exists():
-                    return path
-            except OSError:
-                return None
-        return None
+
+        return self.root_dir / candidate
