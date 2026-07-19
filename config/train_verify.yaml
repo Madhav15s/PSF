@@ -1,0 +1,17 @@
+﻿seed: 42
+device: cpu
+batch_size: 8
+epochs: 1
+learning_rate: 0.0001
+weight_decay: 0.0001
+patience: 1
+target_dim: 5
+num_workers: 0
+amp: false
+pretrained: false
+dropout: 0.0
+checkpoint_dir: artifacts/checkpoints_smoke
+log_dir: artifacts/logs_smoke
+train_manifest: artifacts/smoke_manifests/train.csv
+val_manifest: artifacts/smoke_manifests/val.csv
+root_dir: dataset/generated

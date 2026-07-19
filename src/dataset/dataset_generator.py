@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import sys
 
 import cv2
@@ -193,31 +194,43 @@ class SyntheticDatasetGenerator:
         return source_images[image_index]
 
     def write_manifest_files(self) -> None:
-        """Write train/validation/test manifest CSV files for completed samples."""
+        """Write train/validation/test manifest CSV files from the discovered sample inventory.
+
+        The original bug was that manifests were derived from a simple sample-index
+        split assignment rather than the files actually present on disk. That made
+        manifest generation brittle for partial runs, retries, and rebuilds, and it
+        could leave val/test manifests empty even when samples existed. We now
+        discover generated samples from the output tree, shuffle them with a fixed
+        seed, assign splits from that inventory, validate the resulting split sizes,
+        and only then write the manifests.
+        """
+        sample_rows = self._discover_generated_samples()
+        if not sample_rows:
+            raise FileNotFoundError(f"no generated samples found in: {self.config.output_dir}")
+
+        total_samples = len(sample_rows)
         split_counts = compute_split_counts(
-            samples=self.config.samples,
+            samples=total_samples,
             train_split=self.config.train_split,
             val_split=self.config.val_split,
             test_split=self.config.test_split,
         )
+        self._validate_manifest_splits(total_samples=total_samples, split_counts=split_counts)
+
+        shuffled_rows = self._shuffle_sample_rows(sample_rows)
+        split_rows = self._assign_sample_rows(shuffled_rows, split_counts)
+
         for split_name in SPLIT_NAMES:
-            rows: list[dict[str, str]] = []
-            for sample_index in range(self.config.samples):
-                if split_for_index(sample_index, split_counts) != split_name:
-                    continue
-                sample_id = f"{sample_index + 1:06d}"
-                paths = _sample_paths(self.config.output_dir, split_name, sample_id)
-                if not all(path.exists() for path in paths.values()):
-                    continue
-                rows.append(
-                    {
-                        "sample_id": sample_id,
-                        "sharp_path": paths["sharp"].relative_to(self.config.output_dir).as_posix(),
-                        "blurred_path": paths["blurred"].relative_to(self.config.output_dir).as_posix(),
-                        "psf_path": paths["psf"].relative_to(self.config.output_dir).as_posix(),
-                        "metadata_path": paths["metadata"].relative_to(self.config.output_dir).as_posix(),
-                    }
-                )
+            manifest_rows = [
+                {
+                    "sample_id": sample_row["sample_id"],
+                    "sharp_path": sample_row["sharp_path"].relative_to(self.config.output_dir).as_posix(),
+                    "blurred_path": sample_row["blurred_path"].relative_to(self.config.output_dir).as_posix(),
+                    "psf_path": sample_row["psf_path"].relative_to(self.config.output_dir).as_posix(),
+                    "metadata_path": sample_row["metadata_path"].relative_to(self.config.output_dir).as_posix(),
+                }
+                for sample_row in split_rows[split_name]
+            ]
 
             manifest_path = self.config.output_dir / f"{split_name}.csv"
             with manifest_path.open("w", encoding="utf-8", newline="") as handle:
@@ -226,7 +239,105 @@ class SyntheticDatasetGenerator:
                     fieldnames=["sample_id", "sharp_path", "blurred_path", "psf_path", "metadata_path"],
                 )
                 writer.writeheader()
-                writer.writerows(rows)
+                writer.writerows(manifest_rows)
+
+        self._print_manifest_summary(total_samples=total_samples, split_counts=split_counts, split_rows=split_rows)
+
+    def rebuild_manifest_files(self) -> None:
+        """Rebuild train/val/test manifests from existing generated samples only."""
+        self.write_manifest_files()
+
+    def _discover_generated_samples(self) -> list[dict[str, Path]]:
+        discovered: dict[str, dict[str, Path]] = {}
+        duplicate_ids: list[str] = []
+        # Prefer earlier splits (train, then val, then test) when the same
+        # sample_id appears in multiple folders after resumed/reconfigured runs.
+        for split_name in SPLIT_NAMES:
+            split_root = self.config.output_dir / split_name
+            sharp_dir = split_root / "sharp"
+            blurred_dir = split_root / "blurred"
+            psf_dir = split_root / "psf"
+            metadata_dir = split_root / "metadata"
+            if not sharp_dir.exists():
+                continue
+
+            sharp_stems = _list_stems(sharp_dir, ".png")
+            blurred_stems = _list_stems(blurred_dir, ".png")
+            psf_stems = _list_stems(psf_dir, ".npy")
+            metadata_stems = _list_stems(metadata_dir, ".json")
+            complete_ids = sorted(sharp_stems & blurred_stems & psf_stems & metadata_stems)
+            print(f"Discovered {len(complete_ids)} complete samples under {split_name}/")
+
+            for sample_id in complete_ids:
+                if sample_id in discovered:
+                    duplicate_ids.append(sample_id)
+                    continue
+                discovered[sample_id] = {
+                    "sample_id": sample_id,
+                    "sharp_path": sharp_dir / f"{sample_id}.png",
+                    "blurred_path": blurred_dir / f"{sample_id}.png",
+                    "psf_path": psf_dir / f"{sample_id}.npy",
+                    "metadata_path": metadata_dir / f"{sample_id}.json",
+                }
+
+        if duplicate_ids:
+            unique_duplicates = sorted(set(duplicate_ids))
+            print(
+                f"Warning: skipped {len(unique_duplicates)} duplicate sample_id(s) "
+                f"found across split folders (kept first occurrence). "
+                f"Examples: {unique_duplicates[:5]}"
+            )
+        return [discovered[sample_id] for sample_id in sorted(discovered)]
+
+    def _shuffle_sample_rows(self, sample_rows: list[dict[str, Path]]) -> list[dict[str, Path]]:
+        if not sample_rows:
+            return []
+        seed = self.config.random_seed if self.config.random_seed is not None else 42
+        shuffled = list(sample_rows)
+        rng = np.random.RandomState(seed)
+        rng.shuffle(shuffled)
+        return shuffled
+
+    def _assign_sample_rows(
+        self,
+        sample_rows: list[dict[str, Path]],
+        split_counts: dict[str, int],
+    ) -> dict[str, list[dict[str, Path]]]:
+        split_rows = {split_name: [] for split_name in SPLIT_NAMES}
+        index = 0
+        for split_name in ("train", "val", "test"):
+            count = split_counts[split_name]
+            split_rows[split_name] = sample_rows[index : index + count]
+            index += count
+        return split_rows
+
+    def _validate_manifest_splits(self, total_samples: int, split_counts: dict[str, int]) -> None:
+        if total_samples <= 0:
+            raise ValueError("total samples must be positive.")
+        assigned = sum(split_counts[name] for name in SPLIT_NAMES)
+        if assigned != total_samples:
+            raise ValueError(
+                f"split counts must sum to total samples: got {assigned}, expected {total_samples}."
+            )
+        if split_counts["train"] == 0 and self.config.train_split > 0.0:
+            raise ValueError("train split is empty but train_split was requested to be non-zero.")
+        if split_counts["val"] == 0 and self.config.val_split > 0.0:
+            raise ValueError("validation split is empty but val_split was requested to be non-zero.")
+        if split_counts["test"] == 0 and self.config.test_split > 0.0:
+            raise ValueError("test split is empty but test_split was requested to be non-zero.")
+
+    def _print_manifest_summary(
+        self,
+        total_samples: int,
+        split_counts: dict[str, int],
+        split_rows: dict[str, list[dict[str, Path]]],
+    ) -> None:
+        print("\nDataset manifest summary")
+        print(f"Total samples: {total_samples}")
+        for split_name in SPLIT_NAMES:
+            count = len(split_rows[split_name])
+            percentage = (count / total_samples * 100.0) if total_samples else 0.0
+            print(f"{split_name.title()}: {count} samples ({percentage:.2f}%)")
 
     def _progress(self, completed: int) -> None:
         if not self.config.show_progress:
@@ -425,6 +536,22 @@ def _sample_paths(output_dir: Path, split_name: str, sample_id: str) -> dict[str
         "psf": split_root / "psf" / f"{sample_id}.npy",
         "metadata": split_root / "metadata" / f"{sample_id}.json",
     }
+
+
+def _list_stems(directory: Path, suffix: str) -> set[str]:
+    """Return file stems for ``suffix`` entries using a fast directory scan."""
+    if not directory.exists():
+        return set()
+    suffix_lower = suffix.lower()
+    stems: set[str] = set()
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            name = entry.name
+            if name.lower().endswith(suffix_lower):
+                stems.add(name[: -len(suffix)])
+    return stems
 
 
 def _save_sample(sample: GeneratedSample, paths: dict[str, Path]) -> None:

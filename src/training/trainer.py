@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,13 +9,31 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.cuda.amp import GradScaler, autocast
-from torch.optim import Optimizer
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 from models.resnet18_regressor import ResNet18Regressor
 from training.losses import mse_loss
 from training.metrics import mean_absolute_error
+
+try:
+    # PyTorch >= 2.4
+    from torch.amp import GradScaler as AmpGradScaler
+except ImportError:  # pragma: no cover - exercised on older torch builds
+    AmpGradScaler = None
+
+from torch.cuda.amp import GradScaler as CudaGradScaler
+
+
+def _build_grad_scaler(*, enabled: bool) -> torch.cuda.amp.GradScaler | Any:
+    """Create a GradScaler compatible with both torch.amp and torch.cuda.amp APIs."""
+    if AmpGradScaler is not None:
+        try:
+            return AmpGradScaler("cuda", enabled=enabled)
+        except TypeError:
+            # Older torch.amp.GradScaler prototypes without device argument.
+            return AmpGradScaler(enabled=enabled)
+    return CudaGradScaler(enabled=enabled)
 
 
 @dataclass
@@ -56,7 +73,10 @@ class Trainer:
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
-        self.scaler = GradScaler(enabled=self.device.type == "cuda" and config.amp) if self.device.type == "cuda" and config.amp else None
+        use_amp = bool(config.amp and self.device.type == "cuda")
+        self.use_amp = use_amp
+        self.scaler = _build_grad_scaler(enabled=True) if use_amp else None
+        self.amp_device_type = "cuda" if self.device.type == "cuda" else "cpu"
         self.loss_fn = mse_loss
         self.metric_fn = mean_absolute_error
         self.best_state = None
@@ -70,12 +90,17 @@ class Trainer:
         checkpoint_root = Path(self.config.checkpoint_dir)
         checkpoint_root.mkdir(parents=True, exist_ok=True)
 
+        if val_loader is not None and len(val_loader) == 0:
+            raise ValueError(
+                "Validation DataLoader has 0 batches. Rebuild manifests so val.csv is populated."
+            )
+
         for epoch in range(self.config.epochs):
             train_loss, train_metric = self._train_epoch(train_loader, epoch)
             val_loss = None
             val_metric = None
             if val_loader is not None:
-                val_loss, val_metric = self._evaluate(val_loader)
+                val_loss, val_metric = self._evaluate(val_loader, epoch)
             history.append(
                 {
                     "epoch": epoch + 1,
@@ -118,13 +143,14 @@ class Trainer:
         running_loss = 0.0
         running_metric = 0.0
         samples_seen = 0
+        total_batches = len(train_loader)
         for batch_idx, (images, targets) in enumerate(train_loader):
-            images = images.to(self.device)
-            targets = targets.to(self.device)
+            images = images.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
             self.optimizer.zero_grad(set_to_none=True)
 
             if self.scaler is not None:
-                with autocast(device_type="cuda" if self.device.type == "cuda" else "cpu", enabled=True):
+                with autocast(device_type=self.amp_device_type, enabled=True):
                     predictions = self.model(images)
                     loss = self.loss_fn(predictions, targets)
                 self.scaler.scale(loss).backward()
@@ -137,14 +163,15 @@ class Trainer:
                 self.optimizer.step()
 
             running_loss += float(loss.item()) * images.size(0)
-            running_metric += float(self.metric_fn(predictions, targets).item()) * images.size(0)
+            running_metric += float(self.metric_fn(predictions.detach(), targets).item()) * images.size(0)
             samples_seen += images.size(0)
 
-            if batch_idx % 100 == 0:
+            if batch_idx % 100 == 0 or batch_idx + 1 == total_batches:
                 print(
-                    f"Epoch {epoch+1}/{self.config.epochs} | "
-                    f"Batch {batch_idx}/{len(train_loader)} | "
-                    f"Loss: {loss.item():.6f}"
+                    f"Epoch {epoch + 1}/{self.config.epochs} | "
+                    f"Batch {batch_idx + 1}/{total_batches} | "
+                    f"Loss: {loss.item():.6f}",
+                    flush=True,
                 )
 
         mean_loss = torch.tensor(running_loss / max(samples_seen, 1), dtype=torch.float32)
@@ -152,19 +179,33 @@ class Trainer:
         return mean_loss, mean_metric
 
     @torch.no_grad()
-    def _evaluate(self, val_loader: DataLoader) -> tuple[torch.Tensor, torch.Tensor]:
+    def _evaluate(self, val_loader: DataLoader, epoch: int) -> tuple[torch.Tensor, torch.Tensor]:
         self.model.eval()
         running_loss = 0.0
         running_metric = 0.0
         samples_seen = 0
-        for images, targets in val_loader:
-            images = images.to(self.device)
-            targets = targets.to(self.device)
-            predictions = self.model(images)
-            loss = self.loss_fn(predictions, targets)
+        total_batches = len(val_loader)
+        print(f"Epoch {epoch + 1}/{self.config.epochs} | Starting validation ({total_batches} batches)...", flush=True)
+        for batch_idx, (images, targets) in enumerate(val_loader):
+            images = images.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            if self.use_amp:
+                with autocast(device_type=self.amp_device_type, enabled=True):
+                    predictions = self.model(images)
+                    loss = self.loss_fn(predictions, targets)
+            else:
+                predictions = self.model(images)
+                loss = self.loss_fn(predictions, targets)
             running_loss += float(loss.item()) * images.size(0)
             running_metric += float(self.metric_fn(predictions, targets).item()) * images.size(0)
             samples_seen += images.size(0)
+            if batch_idx % 100 == 0 or batch_idx + 1 == total_batches:
+                print(
+                    f"Epoch {epoch + 1}/{self.config.epochs} | "
+                    f"Val batch {batch_idx + 1}/{total_batches} | "
+                    f"Loss: {loss.item():.6f}",
+                    flush=True,
+                )
 
         mean_loss = torch.tensor(running_loss / max(samples_seen, 1), dtype=torch.float32)
         mean_metric = torch.tensor(running_metric / max(samples_seen, 1), dtype=torch.float32)
