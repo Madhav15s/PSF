@@ -140,6 +140,13 @@ class Trainer:
             running_metric += float(self.metric_fn(predictions, targets).item()) * images.size(0)
             samples_seen += images.size(0)
 
+            if batch_idx % 100 == 0:
+                print(
+                    f"Epoch {epoch+1}/{self.config.epochs} | "
+                    f"Batch {batch_idx}/{len(train_loader)} | "
+                    f"Loss: {loss.item():.6f}"
+                )
+
         mean_loss = torch.tensor(running_loss / max(samples_seen, 1), dtype=torch.float32)
         mean_metric = torch.tensor(running_metric / max(samples_seen, 1), dtype=torch.float32)
         return mean_loss, mean_metric
